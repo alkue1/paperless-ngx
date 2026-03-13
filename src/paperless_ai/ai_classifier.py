@@ -19,13 +19,13 @@ def build_prompt_without_rag(document: Document) -> str:
     return f"""
     You are a document classification assistant.
 
-    Analyze the following document and extract the following information:
+    Analyze the following document and extract the following information and answer in german:
     - A short descriptive title
     - Tags that reflect the content
-    - Names of people or organizations mentioned
+    - Names of the sender or oganization which created the 
     - The type or category of the document
     - Suggested folder paths for storing the document
-    - Up to 3 relevant dates in YYYY-MM-DD format
+    - the date this document was created 
 
     Filename:
     {filename}
