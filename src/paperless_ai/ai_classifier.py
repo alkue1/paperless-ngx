@@ -21,8 +21,8 @@ def build_prompt_without_rag(document: Document) -> str:
 
     Analyze the following document and extract the following information and answer in german:
     - A short descriptive title
-    - Tags that reflect the content
-    - Names of the sender or oganization which created the 
+    - Tags that reflect the content, at least 3 but maximum is 5
+    - Names of the sender or oganization which created the document
     - The type or category of the document
     - Suggested folder paths for storing the document
     - the date this document was created 
