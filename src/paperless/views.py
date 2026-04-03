@@ -34,9 +34,9 @@ from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import DjangoModelPermissions
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import ModelViewSet
 
-from documents.index import DelayedQuery
 from documents.permissions import PaperlessObjectPermissions
 from documents.tasks import llmindex_index
 from paperless.filters import GroupFilterSet
@@ -52,6 +52,8 @@ from paperless_ai.indexing import vector_store_file_exists
 
 class PaperlessObtainAuthTokenView(ObtainAuthToken):
     serializer_class = PaperlessAuthTokenSerializer
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = "login"
 
 
 class StandardPagination(PageNumberPagination):
@@ -83,20 +85,12 @@ class StandardPagination(PageNumberPagination):
         )
 
     def get_all_result_ids(self):
+        from documents.search import TantivyRelevanceList
+
         query = self.page.paginator.object_list
-        if isinstance(query, DelayedQuery):
-            try:
-                ids = [
-                    query.searcher.ixreader.stored_fields(
-                        doc_num,
-                    )["id"]
-                    for doc_num in query.saved_results.get(0).results.docs()
-                ]
-            except Exception:
-                pass
-        else:
-            ids = self.page.paginator.object_list.values_list("pk", flat=True)
-        return ids
+        if isinstance(query, TantivyRelevanceList):
+            return [h["id"] for h in query._hits]
+        return self.page.paginator.object_list.values_list("pk", flat=True)
 
     def get_paginated_response_schema(self, schema):
         response_schema = super().get_paginated_response_schema(schema)
