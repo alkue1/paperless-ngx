@@ -53,6 +53,18 @@ def build_schema() -> tantivy.Schema:
     # CJK support - not stored, indexed only
     sb.add_text_field("bigram_content", stored=False, tokenizer_name="bigram_analyzer")
 
+    # Simple substring search support for title/content - not stored, indexed only
+    sb.add_text_field(
+        "simple_title",
+        stored=False,
+        tokenizer_name="simple_search_analyzer",
+    )
+    sb.add_text_field(
+        "simple_content",
+        stored=False,
+        tokenizer_name="simple_search_analyzer",
+    )
+
     # Autocomplete prefix scan - stored, not indexed
     sb.add_text_field("autocomplete_word", stored=True, tokenizer_name="raw")
 
@@ -60,6 +72,9 @@ def build_schema() -> tantivy.Schema:
 
     # JSON fields — structured queries: notes.user:alice, custom_fields.name:invoice
     sb.add_json_field("notes", stored=True, tokenizer_name="paperless_text")
+    # Plain-text companion for notes — tantivy's SnippetGenerator does not support
+    # JSON fields, so highlights require a text field with the same content.
+    sb.add_text_field("notes_text", stored=True, tokenizer_name="paperless_text")
     sb.add_json_field("custom_fields", stored=True, tokenizer_name="paperless_text")
 
     for field in (

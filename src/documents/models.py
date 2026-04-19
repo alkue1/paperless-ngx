@@ -381,7 +381,10 @@ class Document(SoftDeleteModel, ModelWithOwner):  # type: ignore[django-manager-
             if isinstance(prefetched_cache, dict)
             else None
         )
-        if prefetched_versions:
+        if prefetched_versions is not None:
+            # Empty list means prefetch ran and found no versions — use own content.
+            if not prefetched_versions:
+                return self.content
             latest_prefetched = max(prefetched_versions, key=lambda doc: doc.id)
             return latest_prefetched.content
 
@@ -623,6 +626,8 @@ class SavedViewFilterRule(models.Model):
         (45, _("added to")),
         (46, _("added from")),
         (47, _("mime type is")),
+        (48, _("simple title search")),
+        (49, _("simple text search")),
     ]
 
     saved_view = models.ForeignKey(

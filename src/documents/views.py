@@ -38,6 +38,7 @@ from django.db.models import Model
 from django.db.models import OuterRef
 from django.db.models import Prefetch
 from django.db.models import Q
+from django.db.models import QuerySet
 from django.db.models import Subquery
 from django.db.models import Sum
 from django.db.models import When
@@ -87,6 +88,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.filters import OrderingFilter
 from rest_framework.filters import SearchFilter
 from rest_framework.generics import GenericAPIView
+from rest_framework.mixins import CreateModelMixin
 from rest_framework.mixins import DestroyModelMixin
 from rest_framework.mixins import ListModelMixin
 from rest_framework.mixins import RetrieveModelMixin
@@ -165,7 +167,9 @@ from documents.permissions import ViewDocumentsPermissions
 from documents.permissions import annotate_document_count_for_related_queryset
 from documents.permissions import get_document_count_filter_for_user
 from documents.permissions import get_objects_for_user_owner_aware
+from documents.permissions import has_global_statistics_permission
 from documents.permissions import has_perms_owner_aware
+from documents.permissions import has_system_status_permission
 from documents.permissions import set_permissions_for_object
 from documents.plugins.date_parsing import get_date_parser
 from documents.schema import generate_object_with_permissions_schema
@@ -246,6 +250,13 @@ if settings.AUDIT_LOG_ENABLED:
 
 logger = logging.getLogger("paperless.api")
 
+# Crossover point for intersect_and_order: below this count use a targeted
+# IN-clause query; at or above this count fall back to a full-table scan +
+# Python set intersection.  The IN-clause is faster for small result sets but
+# degrades on SQLite with thousands of parameters.  PostgreSQL handles large IN
+# clauses efficiently, so this threshold mainly protects SQLite users.
+_TANTIVY_INTERSECT_THRESHOLD = 5_000
+
 
 class IndexView(TemplateView):
     template_name = "index.html"
@@ -289,7 +300,7 @@ class IndexView(TemplateView):
         return context
 
 
-class PassUserMixin(GenericAPIView):
+class PassUserMixin(GenericAPIView[Any]):
     """
     Pass a user object to serializer
     """
@@ -455,7 +466,10 @@ class PermissionsAwareDocumentCountMixin(BulkPermissionMixin, PassUserMixin):
 
 
 @extend_schema_view(**generate_object_with_permissions_schema(CorrespondentSerializer))
-class CorrespondentViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
+class CorrespondentViewSet(
+    PermissionsAwareDocumentCountMixin,
+    ModelViewSet[Correspondent],
+):
     model = Correspondent
 
     queryset = Correspondent.objects.select_related("owner").order_by(Lower("name"))
@@ -492,7 +506,7 @@ class CorrespondentViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
 
 
 @extend_schema_view(**generate_object_with_permissions_schema(TagSerializer))
-class TagViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
+class TagViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[Tag]):
     model = Tag
     serializer_class = TagSerializer
     document_count_through = Document.tags.through
@@ -571,7 +585,10 @@ class TagViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
 
 
 @extend_schema_view(**generate_object_with_permissions_schema(DocumentTypeSerializer))
-class DocumentTypeViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
+class DocumentTypeViewSet(
+    PermissionsAwareDocumentCountMixin,
+    ModelViewSet[DocumentType],
+):
     model = DocumentType
 
     queryset = DocumentType.objects.select_related("owner").order_by(Lower("name"))
@@ -806,7 +823,7 @@ class DocumentViewSet(
     UpdateModelMixin,
     DestroyModelMixin,
     ListModelMixin,
-    GenericViewSet,
+    GenericViewSet[Document],
 ):
     model = Document
     queryset = Document.objects.all()
@@ -901,7 +918,7 @@ class DocumentViewSet(
         return (
             Document.objects.filter(root_document__isnull=True)
             .distinct()
-            .order_by("-created")
+            .order_by("-created", "-id")
             .annotate(effective_content=Coalesce(latest_version_content, F("content")))
             .annotate(num_notes=Count("notes"))
             .select_related("correspondent", "storage_path", "document_type", "owner")
@@ -1246,7 +1263,10 @@ class DocumentViewSet(
         ),
     )
     def suggestions(self, request, pk=None):
-        doc = get_object_or_404(Document.objects.select_related("owner"), pk=pk)
+        doc = get_object_or_404(
+            Document.objects.select_related("owner").prefetch_related("versions"),
+            pk=pk,
+        )
         if request.user is not None and not has_perms_owner_aware(
             request.user,
             "view_document",
@@ -1490,7 +1510,14 @@ class DocumentViewSet(
             ):
                 return HttpResponseForbidden("Insufficient permissions to delete notes")
 
-            note = Note.objects.get(id=int(request.GET.get("id")), document=doc)
+            note_id = request.GET.get("id")
+            if not note_id:
+                raise ValidationError({"id": "This field is required."})
+            try:
+                note_id_int = int(note_id)
+            except ValueError:
+                raise ValidationError({"id": "A valid integer is required."})
+            note = get_object_or_404(Note, id=note_id_int, document=doc)
             if settings.AUDIT_LOG_ENABLED:
                 LogEntry.objects.log_create(
                     instance=doc,
@@ -1950,7 +1977,7 @@ class ChatStreamingSerializer(serializers.Serializer):
     ],
     name="dispatch",
 )
-class ChatStreamingView(GenericAPIView):
+class ChatStreamingView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = ChatStreamingSerializer
 
@@ -1996,10 +2023,22 @@ class ChatStreamingView(GenericAPIView):
         description="Document views including search",
         parameters=[
             OpenApiParameter(
+                name="text",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description="Simple Tantivy-backed text search query string",
+            ),
+            OpenApiParameter(
+                name="title_search",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                description="Simple Tantivy-backed title-only search query string",
+            ),
+            OpenApiParameter(
                 name="query",
                 type=OpenApiTypes.STR,
                 location=OpenApiParameter.QUERY,
-                description="Advanced search query string",
+                description="Advanced Tantivy search query string",
             ),
             OpenApiParameter(
                 name="full_perms",
@@ -2025,86 +2064,200 @@ class ChatStreamingView(GenericAPIView):
     ),
 )
 class UnifiedSearchViewSet(DocumentViewSet):
+    SEARCH_PARAM_NAMES = ("text", "title_search", "query", "more_like_id")
+
     def get_serializer_class(self):
         if self._is_search_request():
             return SearchResultSerializer
         else:
             return DocumentSerializer
 
+    def _get_active_search_params(self, request: Request | None = None) -> list[str]:
+        request = request or self.request
+        return [
+            param for param in self.SEARCH_PARAM_NAMES if param in request.query_params
+        ]
+
     def _is_search_request(self):
-        return (
-            "query" in self.request.query_params
-            or "more_like_id" in self.request.query_params
-        )
+        return bool(self._get_active_search_params())
 
     def list(self, request, *args, **kwargs):
         if not self._is_search_request():
             return super().list(request)
 
+        from documents.search import SearchHit
+        from documents.search import SearchMode
+        from documents.search import TantivyBackend
         from documents.search import TantivyRelevanceList
         from documents.search import get_backend
 
-        try:
-            backend = get_backend()
-            # ORM-filtered queryset: permissions + field filters + ordering (DRF backends applied)
-            filtered_qs = self.filter_queryset(self.get_queryset())
+        def parse_search_params() -> tuple[str | None, bool, bool, int, int]:
+            """Extract query string, search mode, and ordering from request."""
+            active = self._get_active_search_params(request)
+            if len(active) > 1:
+                raise ValidationError(
+                    {
+                        "detail": _(
+                            "Specify only one of text, title_search, query, or more_like_id.",
+                        ),
+                    },
+                )
 
+            ordering_param = request.query_params.get("ordering", "")
+            sort_reverse = ordering_param.startswith("-")
+            sort_field_name = ordering_param.lstrip("-") or None
+            # "score" means relevance order — Tantivy handles it natively,
+            # so treat it as a Tantivy sort to preserve the ranked order through
+            # the ORM intersection step.
+            use_tantivy_sort = (
+                sort_field_name in TantivyBackend.SORTABLE_FIELDS
+                or sort_field_name is None
+                or sort_field_name == "score"
+            )
+
+            try:
+                page_num = int(request.query_params.get("page", 1))
+            except (TypeError, ValueError):
+                page_num = 1
+            page_size = (
+                self.paginator.get_page_size(request) or self.paginator.page_size
+            )
+
+            return sort_field_name, sort_reverse, use_tantivy_sort, page_num, page_size
+
+        def intersect_and_order(
+            all_ids: list[int],
+            filtered_qs: QuerySet[Document],
+            *,
+            use_tantivy_sort: bool,
+        ) -> list[int]:
+            """Intersect search IDs with ORM-visible IDs, preserving order."""
+            if not all_ids:
+                return []
+            if use_tantivy_sort:
+                if len(all_ids) <= _TANTIVY_INTERSECT_THRESHOLD:
+                    # Small result set: targeted IN-clause avoids a full-table scan.
+                    visible_ids = set(
+                        filtered_qs.filter(pk__in=all_ids).values_list("pk", flat=True),
+                    )
+                else:
+                    # Large result set: full-table scan + Python intersection is faster
+                    # than a large IN-clause on SQLite.
+                    visible_ids = set(
+                        filtered_qs.values_list("pk", flat=True),
+                    )
+                return [doc_id for doc_id in all_ids if doc_id in visible_ids]
+            return list(
+                filtered_qs.filter(id__in=all_ids).values_list("pk", flat=True),
+            )
+
+        def run_text_search(
+            backend: TantivyBackend,
+            user: User | None,
+            filtered_qs: QuerySet[Document],
+        ) -> tuple[list[int], list[SearchHit], int]:
+            """Handle text/title/query search: IDs, ORM intersection, page highlights."""
+            if "text" in request.query_params:
+                search_mode = SearchMode.TEXT
+                query_str = request.query_params["text"]
+            elif "title_search" in request.query_params:
+                search_mode = SearchMode.TITLE
+                query_str = request.query_params["title_search"]
+            else:
+                search_mode = SearchMode.QUERY
+                query_str = request.query_params["query"]
+
+            # "score" is not a real Tantivy sort field — it means relevance order,
+            # which is Tantivy's default when no sort field is specified.
+            is_score_sort = sort_field_name == "score"
+            all_ids = backend.search_ids(
+                query_str,
+                user=user,
+                sort_field=(
+                    None if (not use_tantivy_sort or is_score_sort) else sort_field_name
+                ),
+                sort_reverse=sort_reverse,
+                search_mode=search_mode,
+            )
+            ordered_ids = intersect_and_order(
+                all_ids,
+                filtered_qs,
+                use_tantivy_sort=use_tantivy_sort,
+            )
+            # Tantivy returns relevance results best-first (descending score).
+            # ordering=score (ascending, worst-first) requires a reversal.
+            if is_score_sort and not sort_reverse:
+                ordered_ids = list(reversed(ordered_ids))
+
+            page_offset = (page_num - 1) * page_size
+            page_ids = ordered_ids[page_offset : page_offset + page_size]
+            page_hits = backend.highlight_hits(
+                query_str,
+                page_ids,
+                search_mode=search_mode,
+                rank_start=page_offset + 1,
+            )
+            return ordered_ids, page_hits, page_offset
+
+        def run_more_like_this(
+            backend: TantivyBackend,
+            user: User | None,
+            filtered_qs: QuerySet[Document],
+        ) -> tuple[list[int], list[SearchHit], int]:
+            """Handle more_like_id search: permission check, IDs, stub hits."""
+            try:
+                more_like_doc_id = int(request.query_params["more_like_id"])
+                more_like_doc = Document.objects.select_related("owner").get(
+                    pk=more_like_doc_id,
+                )
+            except (TypeError, ValueError, Document.DoesNotExist):
+                raise PermissionDenied(_("Invalid more_like_id"))
+
+            if not has_perms_owner_aware(
+                request.user,
+                "view_document",
+                more_like_doc,
+            ):
+                raise PermissionDenied(_("Insufficient permissions."))
+
+            all_ids = backend.more_like_this_ids(more_like_doc_id, user=user)
+            ordered_ids = intersect_and_order(
+                all_ids,
+                filtered_qs,
+                use_tantivy_sort=True,
+            )
+
+            page_offset = (page_num - 1) * page_size
+            page_ids = ordered_ids[page_offset : page_offset + page_size]
+            page_hits = [
+                SearchHit(id=doc_id, score=0.0, rank=rank, highlights={})
+                for rank, doc_id in enumerate(page_ids, start=page_offset + 1)
+            ]
+            return ordered_ids, page_hits, page_offset
+
+        try:
+            sort_field_name, sort_reverse, use_tantivy_sort, page_num, page_size = (
+                parse_search_params()
+            )
+
+            backend = get_backend()
+            filtered_qs = self.filter_queryset(self.get_queryset())
             user = None if request.user.is_superuser else request.user
 
-            if "query" in request.query_params:
-                query_str = request.query_params["query"]
-                results = backend.search(
-                    query_str,
-                    user=user,
-                    page=1,
-                    page_size=10000,
-                    sort_field=None,
-                    sort_reverse=False,
+            if "more_like_id" in request.query_params:
+                ordered_ids, page_hits, page_offset = run_more_like_this(
+                    backend,
+                    user,
+                    filtered_qs,
                 )
             else:
-                # more_like_id — validate permission on the seed document first
-                try:
-                    more_like_doc_id = int(request.query_params["more_like_id"])
-                    more_like_doc = Document.objects.select_related("owner").get(
-                        pk=more_like_doc_id,
-                    )
-                except (TypeError, ValueError, Document.DoesNotExist):
-                    raise PermissionDenied(_("Invalid more_like_id"))
-
-                if not has_perms_owner_aware(
-                    request.user,
-                    "view_document",
-                    more_like_doc,
-                ):
-                    raise PermissionDenied(_("Insufficient permissions."))
-
-                results = backend.more_like_this(
-                    more_like_doc_id,
-                    user=user,
-                    page=1,
-                    page_size=10000,
+                ordered_ids, page_hits, page_offset = run_text_search(
+                    backend,
+                    user,
+                    filtered_qs,
                 )
 
-            hits_by_id = {h["id"]: h for h in results.hits}
-
-            # Determine sort order: no ordering param -> Tantivy relevance; otherwise -> ORM order
-            ordering_param = request.query_params.get("ordering", "").lstrip("-")
-            if not ordering_param:
-                # Preserve Tantivy relevance order; intersect with ORM-visible IDs
-                orm_ids = set(filtered_qs.values_list("pk", flat=True))
-                ordered_hits = [h for h in results.hits if h["id"] in orm_ids]
-            else:
-                # Use ORM ordering (already applied by DocumentsOrderingFilter)
-                hit_ids = set(hits_by_id.keys())
-                orm_ordered_ids = filtered_qs.filter(id__in=hit_ids).values_list(
-                    "pk",
-                    flat=True,
-                )
-                ordered_hits = [
-                    hits_by_id[pk] for pk in orm_ordered_ids if pk in hits_by_id
-                ]
-
-            rl = TantivyRelevanceList(ordered_hits)
+            rl = TantivyRelevanceList(ordered_ids, page_hits, page_offset)
             page = self.paginate_queryset(rl)
 
             if page is not None:
@@ -2114,15 +2267,18 @@ class UnifiedSearchViewSet(DocumentViewSet):
                 if get_boolean(
                     str(request.query_params.get("include_selection_data", "false")),
                 ):
-                    all_ids = [h["id"] for h in ordered_hits]
+                    # NOTE: pk__in=ordered_ids generates a large SQL IN clause
+                    # for big result sets.  Acceptable today but may need a temp
+                    # table or chunked approach if selection_data becomes slow
+                    # at scale (tens of thousands of matching documents).
                     response.data["selection_data"] = (
                         self._get_selection_data_for_queryset(
-                            filtered_qs.filter(pk__in=all_ids),
+                            filtered_qs.filter(pk__in=ordered_ids),
                         )
                     )
                 return response
 
-            serializer = self.get_serializer(ordered_hits, many=True)
+            serializer = self.get_serializer(page_hits, many=True)
             return Response(serializer.data)
 
         except NotFound:
@@ -2132,6 +2288,8 @@ class UnifiedSearchViewSet(DocumentViewSet):
             if str(e.detail) == str(invalid_more_like_id_message):
                 return HttpResponseForbidden(invalid_more_like_id_message)
             return HttpResponseForbidden(_("Insufficient permissions."))
+        except ValidationError:
+            raise
         except Exception as e:
             logger.warning(f"An error occurred listing search results: {e!s}")
             return HttpResponseBadRequest(
@@ -2233,7 +2391,7 @@ class LogViewSet(ViewSet):
 
 
 @extend_schema_view(**generate_object_with_permissions_schema(SavedViewSerializer))
-class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet):
+class SavedViewViewSet(BulkPermissionMixin, PassUserMixin, ModelViewSet[SavedView]):
     model = SavedView
 
     queryset = SavedView.objects.select_related("owner").prefetch_related(
@@ -2711,7 +2869,7 @@ class RemovePasswordDocumentsView(DocumentOperationPermissionMixin):
         },
     ),
 )
-class PostDocumentView(GenericAPIView):
+class PostDocumentView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = PostDocumentSerializer
     parser_classes = (parsers.MultiPartParser,)
@@ -2832,7 +2990,7 @@ class PostDocumentView(GenericAPIView):
         },
     ),
 )
-class SelectionDataView(GenericAPIView):
+class SelectionDataView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = DocumentListSerializer
     parser_classes = (parsers.MultiPartParser, parsers.JSONParser)
@@ -2936,7 +3094,7 @@ class SelectionDataView(GenericAPIView):
         },
     ),
 )
-class SearchAutoCompleteView(GenericAPIView):
+class SearchAutoCompleteView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, format=None):
@@ -3003,6 +3161,9 @@ class GlobalSearchView(PassUserMixin):
     serializer_class = SearchResultSerializer
 
     def get(self, request, *args, **kwargs):
+        from documents.search import SearchMode
+        from documents.search import get_backend
+
         query = request.query_params.get("query", None)
         if query is None:
             return HttpResponseBadRequest("Query required")
@@ -3019,25 +3180,22 @@ class GlobalSearchView(PassUserMixin):
                 "view_document",
                 Document,
             )
-            # First search by title
-            docs = all_docs.filter(title__icontains=query)
-            if not db_only and len(docs) < OBJECT_LIMIT:
-                # If we don't have enough results, search by content.
-                # Over-fetch from Tantivy (no permission filter) and rely on
-                # the ORM all_docs queryset for authoritative permission gating.
-                from documents.search import get_backend
-
-                fts_results = get_backend().search(
+            if db_only:
+                docs = all_docs.filter(title__icontains=query)[:OBJECT_LIMIT]
+            else:
+                user = None if request.user.is_superuser else request.user
+                matching_ids = get_backend().search_ids(
                     query,
-                    user=None,
-                    page=1,
-                    page_size=1000,
-                    sort_field=None,
-                    sort_reverse=False,
+                    user=user,
+                    search_mode=SearchMode.TEXT,
+                    limit=OBJECT_LIMIT * 3,
                 )
-                fts_ids = {h["id"] for h in fts_results.hits}
-                docs = docs | all_docs.filter(id__in=fts_ids)
-            docs = docs[:OBJECT_LIMIT]
+                docs_by_id = all_docs.in_bulk(matching_ids)
+                docs = [
+                    docs_by_id[doc_id]
+                    for doc_id in matching_ids
+                    if doc_id in docs_by_id
+                ][:OBJECT_LIMIT]
         saved_views = (
             get_objects_for_user_owner_aware(
                 request.user,
@@ -3214,15 +3372,16 @@ class GlobalSearchView(PassUserMixin):
         },
     ),
 )
-class StatisticsView(GenericAPIView):
+class StatisticsView(GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, format=None):
         user = request.user if request.user is not None else None
+        can_view_global_stats = has_global_statistics_permission(user) or user is None
 
         documents = (
             Document.objects.all()
-            if user is None
+            if can_view_global_stats
             else get_objects_for_user_owner_aware(
                 user,
                 "documents.view_document",
@@ -3231,12 +3390,12 @@ class StatisticsView(GenericAPIView):
         )
         tags = (
             Tag.objects.all()
-            if user is None
+            if can_view_global_stats
             else get_objects_for_user_owner_aware(user, "documents.view_tag", Tag)
         ).only("id", "is_inbox_tag")
         correspondent_count = (
             Correspondent.objects.count()
-            if user is None
+            if can_view_global_stats
             else get_objects_for_user_owner_aware(
                 user,
                 "documents.view_correspondent",
@@ -3245,7 +3404,7 @@ class StatisticsView(GenericAPIView):
         )
         document_type_count = (
             DocumentType.objects.count()
-            if user is None
+            if can_view_global_stats
             else get_objects_for_user_owner_aware(
                 user,
                 "documents.view_documenttype",
@@ -3254,7 +3413,7 @@ class StatisticsView(GenericAPIView):
         )
         storage_path_count = (
             StoragePath.objects.count()
-            if user is None
+            if can_view_global_stats
             else get_objects_for_user_owner_aware(
                 user,
                 "documents.view_storagepath",
@@ -3315,7 +3474,7 @@ class StatisticsView(GenericAPIView):
         )
 
 
-class BulkDownloadView(DocumentSelectionMixin, GenericAPIView):
+class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = BulkDownloadSerializer
     parser_classes = (parsers.JSONParser,)
@@ -3368,7 +3527,7 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView):
 
 
 @extend_schema_view(**generate_object_with_permissions_schema(StoragePathSerializer))
-class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
+class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[StoragePath]):
     model = StoragePath
 
     queryset = StoragePath.objects.select_related("owner").order_by(
@@ -3432,7 +3591,7 @@ class StoragePathViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
         return Response(result)
 
 
-class UiSettingsView(GenericAPIView):
+class UiSettingsView(GenericAPIView[Any]):
     queryset = UiSettings.objects.all()
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
     serializer_class = UiSettingsViewSerializer
@@ -3530,7 +3689,7 @@ class UiSettingsView(GenericAPIView):
         },
     ),
 )
-class RemoteVersionView(GenericAPIView):
+class RemoteVersionView(GenericAPIView[Any]):
     cache_key = "remote_version_view_latest_release"
 
     def get(self, request, format=None):
@@ -3607,7 +3766,7 @@ class RemoteVersionView(GenericAPIView):
         ),
     ],
 )
-class TasksViewSet(ReadOnlyModelViewSet):
+class TasksViewSet(ReadOnlyModelViewSet[PaperlessTask]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
     serializer_class = TasksViewSerializer
     filter_backends = (
@@ -3681,7 +3840,14 @@ class TasksViewSet(ReadOnlyModelViewSet):
             )
 
 
-class ShareLinkViewSet(ModelViewSet, PassUserMixin):
+class ShareLinkViewSet(
+    PassUserMixin,
+    CreateModelMixin,
+    RetrieveModelMixin,
+    DestroyModelMixin,
+    ListModelMixin,
+    GenericViewSet,
+):
     model = ShareLink
 
     queryset = ShareLink.objects.all()
@@ -3698,7 +3864,7 @@ class ShareLinkViewSet(ModelViewSet, PassUserMixin):
     ordering_fields = ("created", "expiration", "document")
 
 
-class ShareLinkBundleViewSet(ModelViewSet, PassUserMixin):
+class ShareLinkBundleViewSet(PassUserMixin, ModelViewSet[ShareLinkBundle]):
     model = ShareLinkBundle
 
     queryset = ShareLinkBundle.objects.all()
@@ -4055,7 +4221,7 @@ class BulkEditObjectsView(PassUserMixin):
         return Response({"result": "OK"})
 
 
-class WorkflowTriggerViewSet(ModelViewSet):
+class WorkflowTriggerViewSet(ModelViewSet[WorkflowTrigger]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
 
     serializer_class = WorkflowTriggerSerializer
@@ -4073,7 +4239,7 @@ class WorkflowTriggerViewSet(ModelViewSet):
         return super().partial_update(request, *args, **kwargs)
 
 
-class WorkflowActionViewSet(ModelViewSet):
+class WorkflowActionViewSet(ModelViewSet[WorkflowAction]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
 
     serializer_class = WorkflowActionSerializer
@@ -4098,7 +4264,7 @@ class WorkflowActionViewSet(ModelViewSet):
         return super().partial_update(request, *args, **kwargs)
 
 
-class WorkflowViewSet(ModelViewSet):
+class WorkflowViewSet(ModelViewSet[Workflow]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
 
     serializer_class = WorkflowSerializer
@@ -4116,7 +4282,7 @@ class WorkflowViewSet(ModelViewSet):
     )
 
 
-class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet):
+class CustomFieldViewSet(PermissionsAwareDocumentCountMixin, ModelViewSet[CustomField]):
     permission_classes = (IsAuthenticated, PaperlessObjectPermissions)
 
     serializer_class = CustomFieldSerializer
@@ -4211,7 +4377,7 @@ class SystemStatusView(PassUserMixin):
     permission_classes = (IsAuthenticated,)
 
     def get(self, request, format=None):
-        if not request.user.is_staff:
+        if not has_system_status_permission(request.user):
             return HttpResponseForbidden("Insufficient permissions")
 
         current_version = version.__full_version_str__

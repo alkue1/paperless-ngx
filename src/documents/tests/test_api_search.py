@@ -91,6 +91,135 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         self.assertEqual(response.data["count"], 0)
         self.assertEqual(len(results), 0)
 
+    def test_simple_text_search(self) -> None:
+        tagged = Tag.objects.create(name="invoice")
+        matching_doc = Document.objects.create(
+            title="Quarterly summary",
+            content="Monthly bank report",
+            checksum="T1",
+            pk=11,
+        )
+        matching_doc.tags.add(tagged)
+
+        metadata_only_doc = Document.objects.create(
+            title="Completely unrelated",
+            content="No matching terms here",
+            checksum="T2",
+            pk=12,
+        )
+        metadata_only_doc.tags.add(tagged)
+
+        backend = get_backend()
+        backend.add_or_update(matching_doc)
+        backend.add_or_update(metadata_only_doc)
+
+        response = self.client.get("/api/documents/?text=monthly")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], matching_doc.id)
+
+        response = self.client.get("/api/documents/?text=tag:invoice")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_simple_text_search_matches_substrings(self) -> None:
+        matching_doc = Document.objects.create(
+            title="Quarterly summary",
+            content="Password reset instructions",
+            checksum="T5",
+            pk=15,
+        )
+
+        backend = get_backend()
+        backend.add_or_update(matching_doc)
+
+        response = self.client.get("/api/documents/?text=pass")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], matching_doc.id)
+
+        response = self.client.get("/api/documents/?text=sswo")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], matching_doc.id)
+
+        response = self.client.get("/api/documents/?text=sswo re")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], matching_doc.id)
+
+    def test_simple_text_search_does_not_match_on_partial_term_overlap(self) -> None:
+        non_matching_doc = Document.objects.create(
+            title="Adobe Acrobat PDF Files",
+            content="Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
+            checksum="T7",
+            pk=17,
+        )
+
+        backend = get_backend()
+        backend.add_or_update(non_matching_doc)
+
+        response = self.client.get("/api/documents/?text=raptor")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 0)
+
+    def test_simple_title_search(self) -> None:
+        title_match = Document.objects.create(
+            title="Quarterly summary",
+            content="No matching content here",
+            checksum="T3",
+            pk=13,
+        )
+        content_only = Document.objects.create(
+            title="Completely unrelated",
+            content="Quarterly summary appears only in content",
+            checksum="T4",
+            pk=14,
+        )
+
+        backend = get_backend()
+        backend.add_or_update(title_match)
+        backend.add_or_update(content_only)
+
+        response = self.client.get("/api/documents/?title_search=quarterly")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], title_match.id)
+
+    def test_simple_title_search_matches_substrings(self) -> None:
+        title_match = Document.objects.create(
+            title="Password handbook",
+            content="No matching content here",
+            checksum="T6",
+            pk=16,
+        )
+
+        backend = get_backend()
+        backend.add_or_update(title_match)
+
+        response = self.client.get("/api/documents/?title_search=pass")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], title_match.id)
+
+        response = self.client.get("/api/documents/?title_search=sswo")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], title_match.id)
+
+        response = self.client.get("/api/documents/?title_search=sswo hand")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["id"], title_match.id)
+
+    def test_search_rejects_multiple_search_modes(self) -> None:
+        response = self.client.get("/api/documents/?text=bank&query=bank")
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data["detail"],
+            "Specify only one of text, title_search, query, or more_like_id.",
+        )
+
     def test_search_returns_all_for_api_version_9(self) -> None:
         d1 = Document.objects.create(
             title="invoice",
@@ -1374,6 +1503,126 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
             [d2.id, d1.id, d3.id],
         )
 
+    def test_search_ordering_by_score(self) -> None:
+        """ordering=-score must return results in descending relevance order (best first)."""
+        backend = get_backend()
+        # doc_high has more occurrences of the search term → higher BM25 score
+        doc_low = Document.objects.create(
+            title="score sort low",
+            content="apple",
+            checksum="SCL1",
+        )
+        doc_high = Document.objects.create(
+            title="score sort high",
+            content="apple apple apple apple apple",
+            checksum="SCH1",
+        )
+        backend.add_or_update(doc_low)
+        backend.add_or_update(doc_high)
+
+        # -score = descending = best first (highest score)
+        response = self.client.get("/api/documents/?query=apple&ordering=-score")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(
+            ids[0],
+            doc_high.id,
+            "Most relevant doc should be first for -score",
+        )
+
+        # score = ascending = worst first (lowest score)
+        response = self.client.get("/api/documents/?query=apple&ordering=score")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(
+            ids[0],
+            doc_low.id,
+            "Least relevant doc should be first for +score",
+        )
+
+    def test_search_with_tantivy_native_sort(self) -> None:
+        """When ordering by a Tantivy-sortable field, results must be correctly sorted."""
+        backend = get_backend()
+        for i, asn in enumerate([30, 10, 20]):
+            doc = Document.objects.create(
+                title=f"sortable doc {i}",
+                content="searchable content",
+                checksum=f"TNS{i}",
+                archive_serial_number=asn,
+            )
+            backend.add_or_update(doc)
+
+        response = self.client.get(
+            "/api/documents/?query=searchable&ordering=archive_serial_number",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        asns = [doc["archive_serial_number"] for doc in response.data["results"]]
+        self.assertEqual(asns, [10, 20, 30])
+
+        response = self.client.get(
+            "/api/documents/?query=searchable&ordering=-archive_serial_number",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        asns = [doc["archive_serial_number"] for doc in response.data["results"]]
+        self.assertEqual(asns, [30, 20, 10])
+
+    def test_search_page_2_returns_correct_slice(self) -> None:
+        """Page 2 must return the second slice, not overlap with page 1."""
+        backend = get_backend()
+        for i in range(10):
+            doc = Document.objects.create(
+                title=f"doc {i}",
+                content="paginated content",
+                checksum=f"PG2{i}",
+                archive_serial_number=i + 1,
+            )
+            backend.add_or_update(doc)
+
+        response = self.client.get(
+            "/api/documents/?query=paginated&ordering=archive_serial_number&page=1&page_size=3",
+        )
+        page1_ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(len(page1_ids), 3)
+
+        response = self.client.get(
+            "/api/documents/?query=paginated&ordering=archive_serial_number&page=2&page_size=3",
+        )
+        page2_ids = [r["id"] for r in response.data["results"]]
+        self.assertEqual(len(page2_ids), 3)
+
+        # No overlap between pages
+        self.assertEqual(set(page1_ids) & set(page2_ids), set())
+        # Page 2 ASNs are higher than page 1
+        page1_asns = [
+            Document.objects.get(pk=pk).archive_serial_number for pk in page1_ids
+        ]
+        page2_asns = [
+            Document.objects.get(pk=pk).archive_serial_number for pk in page2_ids
+        ]
+        self.assertTrue(max(page1_asns) < min(page2_asns))
+
+    def test_search_all_field_contains_all_ids_when_paginated(self) -> None:
+        """The 'all' field must contain every matching ID, even when paginated."""
+        backend = get_backend()
+        doc_ids = []
+        for i in range(10):
+            doc = Document.objects.create(
+                title=f"all field doc {i}",
+                content="allfield content",
+                checksum=f"AF{i}",
+            )
+            backend.add_or_update(doc)
+            doc_ids.append(doc.pk)
+
+        response = self.client.get(
+            "/api/documents/?query=allfield&page=1&page_size=3",
+            headers={"Accept": "application/json; version=9"},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 3)
+        # "all" must contain ALL 10 matching IDs
+        self.assertCountEqual(response.data["all"], doc_ids)
+
     @mock.patch("documents.bulk_edit.bulk_update_documents")
     def test_global_search(self, m) -> None:
         """
@@ -1492,6 +1741,31 @@ class TestDocumentSearchApi(DirectoriesMixin, APITestCase):
         self.assertEqual(results["mail_rules"][0]["id"], mail_rule1.id)
         self.assertEqual(results["custom_fields"][0]["id"], custom_field1.id)
         self.assertEqual(results["workflows"][0]["id"], workflow1.id)
+
+    def test_global_search_db_only_limits_documents_to_title_matches(self) -> None:
+        title_match = Document.objects.create(
+            title="bank statement",
+            content="no additional terms",
+            checksum="GS1",
+            pk=21,
+        )
+        content_only = Document.objects.create(
+            title="not a title match",
+            content="bank appears only in content",
+            checksum="GS2",
+            pk=22,
+        )
+
+        backend = get_backend()
+        backend.add_or_update(title_match)
+        backend.add_or_update(content_only)
+
+        self.client.force_authenticate(self.user)
+
+        response = self.client.get("/api/search/?query=bank&db_only=true")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["documents"]), 1)
+        self.assertEqual(response.data["documents"][0]["id"], title_match.id)
 
     def test_global_search_filters_owned_mail_objects(self) -> None:
         user1 = User.objects.create_user("mail-search-user")
