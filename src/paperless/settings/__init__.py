@@ -133,7 +133,6 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework.authtoken",
     "django_filters",
-    "django_celery_results",
     "guardian",
     "allauth",
     "allauth.account",
@@ -464,10 +463,11 @@ SECURE_PROXY_SSL_HEADER = (
     else None
 )
 
-SECRET_KEY = os.getenv("PAPERLESS_SECRET_KEY", "")
-if not SECRET_KEY:  # pragma: no cover
+SECRET_KEY = os.getenv("PAPERLESS_SECRET_KEY")
+_INSECURE_SECRET_KEYS = {None, "", "change-me"}
+if not DEBUG and SECRET_KEY in _INSECURE_SECRET_KEYS:  # pragma: no cover
     raise ImproperlyConfigured(
-        "PAPERLESS_SECRET_KEY is not set. "
+        "PAPERLESS_SECRET_KEY is not set or is the default 'change-me' value. "
         "A unique, secret key is required for secure operation. "
         'Generate one with: python3 -c "import secrets; print(secrets.token_urlsafe(64))"',
     )
@@ -669,8 +669,6 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT: Final[int] = get_int_from_env("PAPERLESS_WORKER_TIMEOUT", 1800)
 
-CELERY_RESULT_EXTENDED = True
-CELERY_RESULT_BACKEND = "django-db"
 CELERY_CACHE_BACKEND = "default"
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#task-serializer
