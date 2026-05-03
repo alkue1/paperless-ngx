@@ -281,8 +281,7 @@ class IndexView(TemplateView):
             first = lang[: lang.index("-")]
             second = lang[lang.index("-") + 1 :]
             return f"{first}-{second.upper()}"
-        else:
-            return lang
+        return lang
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -427,9 +426,7 @@ class BulkPermissionMixin:
 
 
 class PermissionsAwareDocumentCountMixin(BulkPermissionMixin, PassUserMixin):
-    """
-    Mixin to add document count to queryset, permissions-aware if needed
-    """
+    """Mixin to add document count to queryset, permissions-aware if needed"""
 
     # Default is simple relation path, override for through-table/count specialization.
     document_count_through: type[Model] | None = None
@@ -776,6 +773,43 @@ class EmailDocumentDetailSchema(EmailSerializer):
                     ),
                     "storage_paths": serializers.ListField(
                         child=serializers.IntegerField(),
+                    ),
+                    "dates": serializers.ListField(child=serializers.CharField()),
+                },
+            ),
+            400: None,
+            403: None,
+            404: None,
+        },
+    ),
+    ai_suggestions=extend_schema(
+        description="View AI suggestions for the document",
+        responses={
+            200: inline_serializer(
+                name="AISuggestions",
+                fields={
+                    "title": serializers.CharField(allow_null=True),
+                    "correspondents": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_correspondents": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "tags": serializers.ListField(child=serializers.IntegerField()),
+                    "suggested_tags": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "document_types": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_document_types": serializers.ListField(
+                        child=serializers.CharField(),
+                    ),
+                    "storage_paths": serializers.ListField(
+                        child=serializers.IntegerField(),
+                    ),
+                    "suggested_storage_paths": serializers.ListField(
+                        child=serializers.CharField(),
                     ),
                     "dates": serializers.ListField(child=serializers.CharField()),
                 },
@@ -1231,8 +1265,7 @@ class DocumentViewSet(
     def get_filesize(self, filename):
         if Path(filename).is_file():
             return Path(filename).stat().st_size
-        else:
-            return None
+        return None
 
     @action(methods=["get"], detail=True, filter_backends=[])
     @method_decorator(cache_control(no_cache=True))
@@ -1312,104 +1345,134 @@ class DocumentViewSet(
         ):
             return HttpResponseForbidden("Insufficient permissions")
 
+        document_suggestions = get_suggestion_cache(doc.pk)
+
+        if document_suggestions is not None:
+            refresh_suggestions_cache(doc.pk)
+            return Response(document_suggestions.suggestions)
+
+        classifier = load_classifier()
+
+        dates = []
+        if settings.NUMBER_OF_SUGGESTED_DATES > 0:
+            with get_date_parser() as date_parser:
+                gen = date_parser.parse(doc.filename, doc.content)
+                dates = sorted(
+                    {
+                        i
+                        for i in itertools.islice(
+                            gen,
+                            settings.NUMBER_OF_SUGGESTED_DATES,
+                        )
+                    },
+                )
+
+        resp_data = {
+            "correspondents": [
+                c.id for c in match_correspondents(doc, classifier, request.user)
+            ],
+            "tags": [t.id for t in match_tags(doc, classifier, request.user)],
+            "document_types": [
+                dt.id for dt in match_document_types(doc, classifier, request.user)
+            ],
+            "storage_paths": [
+                dt.id for dt in match_storage_paths(doc, classifier, request.user)
+            ],
+            "dates": [date.strftime("%Y-%m-%d") for date in dates if date is not None],
+        }
+
+        # Cache the suggestions and the classifier hash for later
+        set_suggestions_cache(doc.pk, resp_data, classifier)
+
+        return Response(resp_data)
+
+    @action(
+        methods=["get"],
+        detail=True,
+        filter_backends=[],
+        url_path="ai_suggestions",
+    )
+    @method_decorator(cache_control(no_cache=True))
+    def ai_suggestions(self, request, pk=None):
+        doc = get_object_or_404(
+            Document.objects.select_related("owner").prefetch_related("versions"),
+            pk=pk,
+        )
+        if request.user is not None and not has_perms_owner_aware(
+            request.user,
+            "view_document",
+            doc,
+        ):
+            return HttpResponseForbidden("Insufficient permissions")
+
         ai_config = AIConfig()
+        if not ai_config.ai_enabled:
+            return HttpResponseBadRequest("AI is required for this feature")
 
-        if ai_config.ai_enabled:
-            cached_llm_suggestions = get_llm_suggestion_cache(
-                doc.pk,
-                backend=ai_config.llm_backend,
-            )
+        cached_llm_suggestions = get_llm_suggestion_cache(
+            doc.pk,
+            backend=ai_config.llm_backend,
+        )
 
-            if cached_llm_suggestions:
-                refresh_suggestions_cache(doc.pk)
-                return Response(cached_llm_suggestions.suggestions)
+        if cached_llm_suggestions:
+            refresh_suggestions_cache(doc.pk)
+            return Response(cached_llm_suggestions.suggestions)
 
+        try:
             llm_suggestions = get_ai_document_classification(doc, request.user)
+        except ValueError as exc:
+            logger.exception(
+                "Invalid AI configuration while generating suggestions for "
+                "document %s: %s",
+                doc.pk,
+                exc,
+                exc_info=True,
+            )
+            raise ValidationError({"ai": [_("Invalid AI configuration.")]}) from exc
 
-            matched_tags = match_tags_by_name(
+        matched_tags = match_tags_by_name(
+            llm_suggestions.get("tags", []),
+            request.user,
+        )
+        matched_correspondents = match_correspondents_by_name(
+            llm_suggestions.get("correspondents", []),
+            request.user,
+        )
+        matched_types = match_document_types_by_name(
+            llm_suggestions.get("document_types", []),
+            request.user,
+        )
+        matched_paths = match_storage_paths_by_name(
+            llm_suggestions.get("storage_paths", []),
+            request.user,
+        )
+
+        resp_data = {
+            "title": llm_suggestions.get("title"),
+            "tags": [t.id for t in matched_tags],
+            "suggested_tags": extract_unmatched_names(
                 llm_suggestions.get("tags", []),
-                request.user,
-            )
-            matched_correspondents = match_correspondents_by_name(
+                matched_tags,
+            ),
+            "correspondents": [c.id for c in matched_correspondents],
+            "suggested_correspondents": extract_unmatched_names(
                 llm_suggestions.get("correspondents", []),
-                request.user,
-            )
-            matched_types = match_document_types_by_name(
+                matched_correspondents,
+            ),
+            "document_types": [d.id for d in matched_types],
+            "suggested_document_types": extract_unmatched_names(
                 llm_suggestions.get("document_types", []),
-                request.user,
-            )
-            matched_paths = match_storage_paths_by_name(
+                matched_types,
+            ),
+            "storage_paths": [s.id for s in matched_paths],
+            "suggested_storage_paths": extract_unmatched_names(
                 llm_suggestions.get("storage_paths", []),
-                request.user,
-            )
+                matched_paths,
+            ),
+            "dates": llm_suggestions.get("dates", []),
+        }
 
-            resp_data = {
-                "title": llm_suggestions.get("title"),
-                "tags": [t.id for t in matched_tags],
-                "suggested_tags": extract_unmatched_names(
-                    llm_suggestions.get("tags", []),
-                    matched_tags,
-                ),
-                "correspondents": [c.id for c in matched_correspondents],
-                "suggested_correspondents": extract_unmatched_names(
-                    llm_suggestions.get("correspondents", []),
-                    matched_correspondents,
-                ),
-                "document_types": [d.id for d in matched_types],
-                "suggested_document_types": extract_unmatched_names(
-                    llm_suggestions.get("document_types", []),
-                    matched_types,
-                ),
-                "storage_paths": [s.id for s in matched_paths],
-                "suggested_storage_paths": extract_unmatched_names(
-                    llm_suggestions.get("storage_paths", []),
-                    matched_paths,
-                ),
-                "dates": llm_suggestions.get("dates", []),
-            }
-
-            set_llm_suggestions_cache(doc.pk, resp_data, backend=ai_config.llm_backend)
-        else:
-            document_suggestions = get_suggestion_cache(doc.pk)
-
-            if document_suggestions is not None:
-                refresh_suggestions_cache(doc.pk)
-                return Response(document_suggestions.suggestions)
-
-            classifier = load_classifier()
-
-            dates = []
-            if settings.NUMBER_OF_SUGGESTED_DATES > 0:
-                with get_date_parser() as date_parser:
-                    gen = date_parser.parse(doc.filename, doc.content)
-                    dates = sorted(
-                        {
-                            i
-                            for i in itertools.islice(
-                                gen,
-                                settings.NUMBER_OF_SUGGESTED_DATES,
-                            )
-                        },
-                    )
-
-            resp_data = {
-                "correspondents": [
-                    c.id for c in match_correspondents(doc, classifier, request.user)
-                ],
-                "tags": [t.id for t in match_tags(doc, classifier, request.user)],
-                "document_types": [
-                    dt.id for dt in match_document_types(doc, classifier, request.user)
-                ],
-                "storage_paths": [
-                    dt.id for dt in match_storage_paths(doc, classifier, request.user)
-                ],
-                "dates": [
-                    date.strftime("%Y-%m-%d") for date in dates if date is not None
-                ],
-            }
-
-            # Cache the suggestions and the classifier hash for later
-            set_suggestions_cache(doc.pk, resp_data, classifier)
+        set_llm_suggestions_cache(doc.pk, resp_data, backend=ai_config.llm_backend)
 
         return Response(resp_data)
 
@@ -1449,7 +1512,7 @@ class DocumentViewSet(
             file_doc = self._get_effective_file_doc(request_doc, root_doc, request)
             handle = file_doc.thumbnail_file
 
-            return HttpResponse(handle, content_type="image/webp")
+            return FileResponse(handle, content_type="image/webp")
         except FileNotFoundError:
             raise Http404
 
@@ -2003,7 +2066,7 @@ class DocumentViewSet(
         )
 
 
-class ChatStreamingSerializer(serializers.Serializer):
+class ChatStreamingSerializer(serializers.Serializer[dict[str, Any]]):
     q = serializers.CharField(required=True)
     document_id = serializers.IntegerField(required=False, allow_null=True)
 
@@ -2107,8 +2170,7 @@ class UnifiedSearchViewSet(DocumentViewSet):
     def get_serializer_class(self):
         if self._is_search_request():
             return SearchResultSerializer
-        else:
-            return DocumentSerializer
+        return DocumentSerializer
 
     def _get_active_search_params(self, request: Request | None = None) -> list[str]:
         request = request or self.request
@@ -3226,7 +3288,7 @@ class GlobalSearchView(PassUserMixin):
         query = request.query_params.get("query", None)
         if query is None:
             return HttpResponseBadRequest("Query required")
-        elif len(query) < 3:
+        if len(query) < 3:
             return HttpResponseBadRequest("Query must be at least 3 characters")
 
         db_only = request.query_params.get("db_only", False)
@@ -3521,7 +3583,7 @@ class StatisticsView(GenericAPIView[Any]):
                 "inbox_tag": (
                     inbox_tag_pks[0] if inbox_tag_pks else None
                 ),  # backwards compatibility
-                "inbox_tags": (inbox_tag_pks if inbox_tag_pks else None),
+                "inbox_tags": (inbox_tag_pks or None),
                 "document_file_type_counts": document_file_type_counts,
                 "character_count": character_count,
                 "tag_count": len(tags),
@@ -3533,6 +3595,16 @@ class StatisticsView(GenericAPIView[Any]):
         )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        operation_id="bulk_download",
+        description="Download multiple documents as a ZIP archive.",
+        responses={
+            (HTTPStatus.OK, "application/zip"): OpenApiTypes.BINARY,
+            HTTPStatus.FORBIDDEN: None,
+        },
+    ),
+)
 class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
     permission_classes = (IsAuthenticated,)
     serializer_class = BulkDownloadSerializer
@@ -3555,13 +3627,6 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
             if not has_perms_owner_aware(request.user, "change_document", document):
                 return HttpResponseForbidden("Insufficient permissions")
 
-        settings.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
-        temp = tempfile.NamedTemporaryFile(  # noqa: SIM115
-            dir=settings.SCRATCH_DIR,
-            suffix="-compressed-archive",
-            delete=False,
-        )
-
         if content == "both":
             strategy_class = OriginalAndArchiveStrategy
         elif content == "originals":
@@ -3569,20 +3634,35 @@ class BulkDownloadView(DocumentSelectionMixin, GenericAPIView[Any]):
         else:
             strategy_class = ArchiveOnlyStrategy
 
-        with zipfile.ZipFile(temp.name, "w", compression) as zipf:
-            strategy = strategy_class(zipf, follow_formatting=follow_filename_format)
-            for document in documents:
-                strategy.add_document(document)
+        settings.SCRATCH_DIR.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            dir=settings.SCRATCH_DIR,
+            suffix="-compressed-archive",
+        )
+        os.close(fd)
+        temp_path = Path(temp_name)
 
-        # TODO(stumpylog): Investigate using FileResponse here
-        with Path(temp.name).open("rb") as f:
-            response = HttpResponse(f, content_type="application/zip")
-            response["Content-Disposition"] = '{}; filename="{}"'.format(
-                "attachment",
-                "documents.zip",
-            )
+        try:
+            with zipfile.ZipFile(temp_path, "w", compression) as zipf:
+                strategy = strategy_class(
+                    zipf,
+                    follow_formatting=follow_filename_format,
+                )
+                for document in documents:
+                    strategy.add_document(document)
 
-            return response
+            f = temp_path.open("rb")
+            temp_path.unlink()
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+        return FileResponse(
+            f,
+            as_attachment=True,
+            filename="documents.zip",
+            content_type="application/zip",
+        )
 
 
 @extend_schema_view(
@@ -4290,7 +4370,7 @@ def serve_file(
     use_archive: bool,
     disposition: str,
     follow_formatting: bool = False,
-) -> HttpResponse:
+) -> FileResponse:
     if use_archive:
         if TYPE_CHECKING:
             assert doc.archive_filename
@@ -4313,7 +4393,7 @@ def serve_file(
         if mime_type in {"application/csv", "text/csv"} and disposition == "inline":
             mime_type = "text/plain"
 
-    response = HttpResponse(file_handle, content_type=mime_type)
+    response = FileResponse(file_handle, content_type=mime_type)
     # Firefox is not able to handle unicode characters in filename field
     # RFC 5987 addresses this issue
     # see https://datatracker.ietf.org/doc/html/rfc5987#section-4.2

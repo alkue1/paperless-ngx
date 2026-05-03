@@ -1,7 +1,7 @@
 import { JsonPipe, NgTemplateOutlet } from '@angular/common'
 import { Component, inject, OnDestroy, OnInit } from '@angular/core'
 import { FormsModule, ReactiveFormsModule } from '@angular/forms'
-import { Router } from '@angular/router'
+import { Router, RouterLink } from '@angular/router'
 import {
   NgbCollapseModule,
   NgbDropdownModule,
@@ -138,6 +138,7 @@ const TRIGGER_SOURCE_OPTIONS: Array<{
     FormsModule,
     ReactiveFormsModule,
     NgTemplateOutlet,
+    RouterLink,
     NgbCollapseModule,
     NgbDropdownModule,
     NgbPaginationModule,
@@ -333,11 +334,6 @@ export class TasksComponent
     }
   }
 
-  dismissAndGo(task: PaperlessTask) {
-    this.dismissTask(task)
-    this.router.navigate(['documents', task.related_document_ids?.[0]])
-  }
-
   expandTask(task: PaperlessTask) {
     this.expandedTask = this.expandedTask == task.id ? undefined : task.id
   }
@@ -378,7 +374,7 @@ export class TasksComponent
 
     const documentId = task.result_data?.['document_id']
     if (typeof documentId === 'number') {
-      return `Success. New document id ${documentId} created`
+      return $localize`Success. New document id ${documentId} created`
     }
 
     const reason = task.result_data?.['reason']
@@ -388,7 +384,7 @@ export class TasksComponent
 
     const duplicateOf = task.result_data?.['duplicate_of']
     if (typeof duplicateOf === 'number') {
-      return `Duplicate of document #${duplicateOf}`
+      return $localize`Duplicate of document #${duplicateOf}`
     }
 
     const errorMessage = task.result_data?.['error_message']
