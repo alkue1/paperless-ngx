@@ -19,7 +19,7 @@ def build_prompt_without_rag(document: Document) -> str:
     return f"""
     You are a document classification assistant.
 
-    Analyze the following document and extract the following information and answer in german:
+    Analyze the following document and extract the following information and answer ALWAYS in german:
     - A short descriptive title
     - Tags that reflect the content, at least 3 but maximum is 5
     - Names of the sender or oganization which created the document
